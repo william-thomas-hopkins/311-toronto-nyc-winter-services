@@ -1,30 +1,25 @@
 #src/runtime/config.py
 
-import os
-import sys
-import json
-import hashlib
-import random
+#project wide run-time configurations
+#create a single source of truth config dict, persists it as artifacts/CONFIG.json, and exposes 'get_config()' for all other modules
+
+from __future__ import annotations
+import os, sys, json, hashlib, random
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 
-"""
-I origionally worked through a lot of the code code in a colab notebook. Here I'm creating a single source of truth and combining the core logic of cells 0.1, 0.2, 0.3
-"""
-
-os.environ.setdefault("OMP_NUM_THREADS","1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS","1")
-os.environ.setdefault("MKL_NUM_THREADS","1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS","1")
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+             "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-CONFIG: Dict[str, Any] ={
+CONFIG: Dict[str, Any] = {
     "version": 4,
     "code_tag": "311_snow_modular_v1.0",
     "paths": {
         "PROJECT_ROOT": str(PROJECT_ROOT),
-        "ARTIFACTS_DIR": str(PROJECT_ROOT / 'artifacts'),
+        "ARTIFACTS_DIR": str(PROJECT_ROOT / "artifacts"),
         "DATA_DIR": str(PROJECT_ROOT / "data"),
         "RAW_DATA_DIR": str(PROJECT_ROOT / "data" / "raw"),
         "PROCESSED_DATA_DIR": str(PROJECT_ROOT / "data" / "processed"),
@@ -32,12 +27,12 @@ CONFIG: Dict[str, Any] ={
         "CACHE_DIR": str(PROJECT_ROOT / "artifacts" / "cache"),
     },
     "api": {
-        "NYC_APP_TOKEN_ENV_VAR": "JyXhUB9SyOtl0BQhv5p98l7nl",
+        "NYC_APP_TOKEN_ENV_VAR": "NYC_APP_TOKEN",
         "NYC_BASE_URL": "https://data.cityofnewyork.us",
         "NYC_DATASET_ID": "erm2-nwe9",
     },
     "libs": {
-         "numpy": "1.26.4",
+        "numpy": "1.26.4",
         "pandas": "2.2.2",
         "scikit-learn": "1.4.2",
         "scikit-survival": "0.23.0",
@@ -50,7 +45,6 @@ CONFIG: Dict[str, Any] ={
         "plotly": "5.22.0",
     },
     "analysis": {
-        # Parameters from Cell 0.1
         "REWORK_DIST_M": 50,
         "REWORK_WINDOW_H": 48,
         "APPLY_WINTER_GUARD": True,
@@ -61,7 +55,6 @@ CONFIG: Dict[str, Any] ={
 }
 
 def _make_serializable(obj: Any) -> Any:
-    """Recursively makes an object JSON serializable (e.g. converts Path objects to strings)"""
     if isinstance(obj, dict):
         return {k: _make_serializable(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -70,75 +63,48 @@ def _make_serializable(obj: Any) -> Any:
         return str(obj)
     return obj
 
-def compute_config_hash(config: Dict[str, Any]) -> str:
-    """Computes a unique and deterministic SHA256 hash of the configuration dictionary."""
-    serializable_config = _make_serializable(config)
-    config_string = json.dumps(serializable_config, sort_keys=True, separators=(',', ':'))
-    return hashlib.sha256(config_string.encode()).hexdigest()[:16]
+def _compute_config_hash(cfg: Dict[str, Any]) -> str:
+    blob = json.dumps(_make_serializable(cfg), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
-def apply_seeds(config: Dict[str, Any]):
-    """Applies random seeds for reproducibility across libraries."""
-    py_seed = config["seeds"]["PYTHON_SEED"]
-    random.seed(py_seed)
-    os.environ["PYTHONHASHSEED"] = str(py_seed)
+def _apply_seeds(cfg: Dict[str, Any]) -> None:
+    random.seed(cfg["seeds"]["PYTHON_SEED"])
+    os.environ["PYTHONHASHSEED"] = str(cfg["seeds"]["PYTHON_SEED"])
     try:
         import numpy as np
-        np.random.seed(config["seeds"]["NUMPY_SEED"])
+        np.random.seed(cfg["seeds"]["NUMPY_SEED"])
     except ImportError:
-        print("Warning: numpy not found. Skipping numpy seed application.", file=sys.stderr)
+        pass
 
-def get_nyc_app_token() -> str | None:
-    """Safely retrieves the NYC App Token from environment variables."""
+def get_nyc_app_token() -> Optional[str]:
     return os.getenv(CONFIG["api"]["NYC_APP_TOKEN_ENV_VAR"])
 
-_CONFIG_INSTANCE = None
+_CONFIG_INSTANCE: Optional[Dict[str, Any]] = None
 
 def get_config() -> Dict[str, Any]:
     """
-    The main entry point for the rest of the application to get the configuration.
-    
-    Initializes the project configuration on first call: creates directories,
-    applies seeds, computes the hash, and writes CONFIG.json. On subsequent
-    calls, it returns the already loaded configuration.
-    
-    Returns:
-        The fully hydrated CONFIG dictionary.
+    Lazy-initialise CONFIG; returns the *same* dict on every call.
     """
     global _CONFIG_INSTANCE
     if _CONFIG_INSTANCE is not None:
         return _CONFIG_INSTANCE
 
-    print("🔧 Initializing project configuration...")
+    # create dirs
+    for p in CONFIG["paths"].values():
+        Path(p).mkdir(parents=True, exist_ok=True)
 
-    # Create all necessary directories defined in config paths
-    for path_str in CONFIG["paths"].values():
-        Path(path_str).mkdir(parents=True, exist_ok=True)
+    _apply_seeds(CONFIG)
+    CONFIG["config_hash"] = _compute_config_hash(CONFIG)
 
-    # Apply seeds for reproducibility
-    apply_seeds(CONFIG)
+    cfg_path = Path(CONFIG["paths"]["ARTIFACTS_DIR"]) / "CONFIG.json"
+    cfg_path.write_text(json.dumps(_make_serializable(CONFIG), indent=2))
 
-    # Add the computed hash to the config itself for tracking
-    CONFIG["config_hash"] = compute_config_hash(CONFIG)
-    
-    # Persist CONFIG.json as the single source of truth on disk for this run
-    config_path = Path(CONFIG["paths"]["ARTIFACTS_DIR"]) / "CONFIG.json"
-    try:
-        config_path.write_text(json.dumps(_make_serializable(CONFIG), indent=2))
-    except IOError as e:
-        print(f"Error: Could not write CONFIG.json to {config_path}. Check permissions.", file=sys.stderr)
-        print(f"Details: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    print("✅ Configuration initialized and written to disk.")
-    print(f"  - Project Root:     {CONFIG['paths']['PROJECT_ROOT']}")
-    print(f"  - Artifacts Dir:    {CONFIG['paths']['ARTIFACTS_DIR']}")
-    print(f"  - Config Hash:      {CONFIG['config_hash']}")
-    
+    print(f"✅ CONFIG initialised → {cfg_path}  (hash={CONFIG['config_hash']})")
     _CONFIG_INSTANCE = CONFIG
-    return _CONFIG_INSTANCE
+    return CONFIG
 
 if __name__ == "__main__":
-    """This block allows you to run the script directly from the command line to perform the initial setup and verify it works. Usage: python -m src.runtime.config"""
-    
     get_config()
 
+   
+# we can run as `python -m src.runtime.config` for a quick sanity check
