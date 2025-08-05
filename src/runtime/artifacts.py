@@ -72,6 +72,7 @@ ARTIFACTS: Dict[str, Dict[str, Any]] = {
         "stale_on": ["config_hash", "code_tag"],
     },
 }
+}
 
 def _lib_versions() -> Dict[str, str]:
     out = {}
@@ -170,11 +171,11 @@ def load_artifact(name: str,
 
     return df, meta, status
 
-def list_artifacts() -> None:
+def list_artifacts_status() -> None:
     for k in ARTIFACTS:
         df, _, st = load_artifact(k, expect_fresh=False)
         rows = len(df) if df is not None else "-"
         print(f"{k:<18} {st:<12} {rows:>8}")
 
 if __name__ == "__main__":
-    list_artifacts()
+    list_artifacts_status()
