@@ -25,7 +25,6 @@ from typing import Tuple
 import hdbscan
 import numpy as np
 import pandas as pd
-from sklearn.neighbors import BallTree
 
 from src.runtime.config import get_config
 from src.runtime.artifacts import load_artifact
@@ -44,7 +43,8 @@ def _write_meta(target_path: Path, meta: dict) -> None:
 
 
 def _to_rad(lat: pd.Series, lon: pd.Series) -> np.ndarray:
-    return np.deg2rad(np.c_[lat.values, lon.values])  # shape (n, 2) -> [lat, lon] in rad
+    # HDBSCAN with metric='haversine' expects [lat, lon] in radians
+    return np.deg2rad(np.c_[lat.values, lon.values])
 
 
 def _haversine_m(lat1, lon1, lat2, lon2) -> np.ndarray:
@@ -59,13 +59,10 @@ def _haversine_m(lat1, lon1, lat2, lon2) -> np.ndarray:
 
 
 def _cluster_one_borough(df_b: pd.DataFrame) -> pd.DataFrame:
-    coords_rad = _to_rad(df_b["latitude"], df_b["longitude"])[:, ::-1]  # BallTree expects [lon, lat] but HDBSCAN uses the same order if metric='haversine'; keep [lat, lon] for HDBSCAN
-    # hdbscan with haversine expects [lat, lon] in radians
     coords_hdb = _to_rad(df_b["latitude"], df_b["longitude"])  # [lat, lon] in rad
-
     n = len(df_b)
     min_cluster_size = max(50, int(0.003 * n))  # ~0.3% of borough rows; floor 50
-    min_samples = 15
+    min_samples = max(15, int(0.0015 * n))      # scale a bit w/ size, min 15
 
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=min_cluster_size,
@@ -82,13 +79,13 @@ def _cluster_one_borough(df_b: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _summarize_clusters(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def _summarize_clusters(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     # Keep only real clusters (>=0); noise = -1
     cl = df[df["spatial_cluster"] >= 0].copy()
     if cl.empty:
-        return df, pd.DataFrame(), pd.DataFrame()
+        return df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    # Compute centroid and radius stats
+    # Centroid & radius stats
     gb = cl.groupby(["borough", "spatial_cluster"], as_index=False)
     centroids = gb[["latitude", "longitude"]].median().rename(
         columns={"latitude": "centroid_lat", "longitude": "centroid_lon"}
@@ -111,15 +108,15 @@ def _summarize_clusters(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, p
     )
     s["compactness"] = s["radius_median_m"] / s["radius_max_m"].clip(lower=1.0)
 
-    # Rank: penalize radius (150 m scale)
+    # Rank: penalize big radii (150m scale)
     s["rank_score"] = s["size"] / (1.0 + s["radius_median_m"] / 150.0)
     s = s.sort_values(["rank_score", "size"], ascending=[False, False], ignore_index=True)
 
-    # Filter umbrella (too-big) clusters
+    # Umbrella filter
     umbrella = s[s["radius_median_m"] > UMBRELLA_RADIUS_M].copy()
     hotspots = s[s["radius_median_m"] <= UMBRELLA_RADIUS_M].copy()
 
-    return merged, s, hotspots if not hotspots.empty else pd.DataFrame(), umbrella
+    return merged, s, hotspots, umbrella
 
 
 def analyze() -> None:
@@ -129,17 +126,16 @@ def analyze() -> None:
 
     geo = geo.dropna(subset=["latitude", "longitude", "borough"]).copy()
 
-    parts = []
-    for bor, df_b in geo.groupby("borough"):
-        parts.append(_cluster_one_borough(df_b))
+    # Run per-borough
+    parts = [ _cluster_one_borough(df_b) for _, df_b in geo.groupby("borough") ]
     labeled = pd.concat(parts, ignore_index=True) if parts else geo.copy()
 
-    # Save labeled points (all, including noise)
+    # Save labeled points
     p_parq = ART / "nyc_spatial_clusters.parquet"
     labeled.to_parquet(p_parq, index=False)
     print(f"💾 Saved nyc_spatial_clusters: {len(labeled):,} rows → {p_parq}")
 
-    # Summaries + rankings
+    # Summaries + ranking
     merged, summary, hotspots, umbrella = _summarize_clusters(labeled)
 
     p_summary = ART / "nyc_spatial_cluster_summary.csv"
@@ -147,7 +143,7 @@ def analyze() -> None:
     _write_meta(
         p_summary,
         {
-            "n_clusters_total": int((summary.shape[0])) if summary is not None else 0,
+            "n_clusters_total": int(summary.shape[0]),
             "umbrella_radius_m": UMBRELLA_RADIUS_M,
             "median_radius_median_m": float(summary["radius_median_m"].median()) if len(summary) else None,
             "p95_radius_median_m": float(summary["radius_median_m"].quantile(0.95)) if len(summary) else None,
@@ -156,7 +152,7 @@ def analyze() -> None:
     print(f"💾 Saved cluster summary → {p_summary}")
 
     p_hot = ART / "hotspot_candidates_ranked.csv"
-    if hotspots is not None and len(hotspots):
+    if len(hotspots):
         hotspots.to_csv(p_hot, index=False)
         _write_meta(
             p_hot,
@@ -164,15 +160,16 @@ def analyze() -> None:
                 "n_hotspots": int(len(hotspots)),
                 "top_hotspot_radius_median_m": float(hotspots.iloc[0]["radius_median_m"]),
                 "top_hotspot_size": int(hotspots.iloc[0]["size"]),
+                "pct_umbrella_filtered": float(100.0 * len(umbrella) / max(1, len(summary))),
             },
         )
         print(f"💾 Saved hotspot ranks → {p_hot}")
     else:
         print("⚠️  No hotspots after umbrella filter; check parameters.")
 
-    # Save umbrella clusters too (for context)
-    p_umb = ART / "nyc_spatial_umbrella_clusters.csv"
-    if umbrella is not None and len(umbrella):
+    # Save umbrella clusters separately (for QA)
+    p_umb = ART / "hotspot_umbrella_clusters.csv"
+    if len(umbrella):
         umbrella.to_csv(p_umb, index=False)
         _write_meta(p_umb, {"n_umbrella": int(len(umbrella)), "radius_threshold_m": UMBRELLA_RADIUS_M})
         print(f"💾 Saved umbrella clusters → {p_umb}")
