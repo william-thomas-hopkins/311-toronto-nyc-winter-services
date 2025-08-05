@@ -1,34 +1,69 @@
 # cli/run.py
 
 import sys
-import os
 from pathlib import Path
+from dotenv import load_dotenv
 
-# This ensures that we can import from the 'src' directory
-# no matter where we run the script from.
+# Load environment variables from a .env file at the project root
+load_dotenv()
+
+# Add the project root to the Python path to allow imports from `src`
 project_root = Path(__file__).resolve().parents[1]
 sys.path.append(str(project_root))
 
+# Import the config initializer at the top level
+from src.runtime.config import get_config
+
+def print_usage():
+    """Prints the available commands."""
+    print("\nUsage: python -m cli.run <command>")
+    print("""
+Available Commands:
+    status              - Check the status of all artifacts.
+    
+    build-toronto       - Build the 'tor_filtered' artifact from raw CSVs.
+    build-nyc           - Build the 'nyc_raw' artifact from the Socrata API.
+    
+    audit-toronto       - Run a series of checks on the Toronto artifact.
+    
+    (More commands will be enabled as we build the project)
+    """)
+
 def main():
-    """Simple CLI to run project tasks."""
+    """The main entry point for the command-line interface."""
+    get_config()
+
     if len(sys.argv) < 2:
-        print("Usage: python -m cli.run <command>")
-        print("Available commands: status")
+        print_usage()
         return
 
     command = sys.argv[1]
 
     if command == "status":
-        # We need to initialize the config first for paths to be set up
-        from src.runtime.config import get_config
-        get_config() 
-        
-        # Now we can safely import and use the artifacts module
         from src.runtime.artifacts import list_artifacts_status
-        print("🔍 Checking artifact status...")
+        print("\n🔍 Checking artifact status...")
         list_artifacts_status()
+
+    elif command == "build-toronto":
+        print("\n🍁 Building Toronto filtered artifact...")
+        from src.ingest.toronto import build
+        build()
+        print("✅ Toronto build complete.")
+
+    elif command == "build-nyc":
+        print("\n🏙️  Building NYC raw artifact...")
+        from src.ingest.nyc import build
+        build()
+        print("✅ NYC build complete.")
+
+    elif command == "audit-toronto":
+        print("\n🔍 Auditing Toronto filtered artifact...")
+        from src.audit.toronto_audit import run_audit
+        run_audit()
+        
     else:
-        print(f"Unknown command: {command}")
+        print(f"\n❌ Unknown command: '{command}'")
+        print_usage()
 
 if __name__ == "__main__":
     main()

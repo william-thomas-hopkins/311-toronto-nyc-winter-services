@@ -95,19 +95,24 @@ def artifact_path(name: str) -> Path:
 def meta_path(name: str) -> Path:
     return artifact_path(name).with_suffix(".parquet.meta.json")
 
+# In src/runtime/artifacts.py
+
+# REPLACE your old save_artifact function with this one:
+
 def save_artifact(name: str,
                   df: pd.DataFrame,
                   extra_meta: Optional[Dict[str, Any]] = None) -> None:
     """
     Atomically write <name>.parquet and side-car JSON meta.
+    This version correctly handles nested lists and dicts in the metadata.
     """
     spec = _artifact_spec(name)
     path = artifact_path(name)
-    tmp  = path.with_suffix(".tmp")
+    tmp  = path.with_suffix(f"{path.suffix}.tmp") # Ensure temp name is unique
 
     # write parquet
     df.to_parquet(tmp, index=False)
-    os.replace(tmp, path) 
+    os.replace(tmp, path)
 
     meta: Dict[str, Any] = {
         "artifact": name,
@@ -121,22 +126,35 @@ def save_artifact(name: str,
         "columns": list(df.columns),
         "desc": spec.get("desc", ""),
     }
+    
     if extra_meta:
-        def _clean(x):
-            if isinstance(x, (pd.Timestamp, np.datetime64)):
-                return pd.to_datetime(x).tz_convert("UTC").isoformat()
-            if isinstance(x, (np.integer,)):
-                return int(x)
-            if isinstance(x, (np.floating,)):
-                return float(x)
-            if pd.isna(x):
+        # This new recursive function can handle any nested structure
+        def _sanitize(obj):
+            if isinstance(obj, dict):
+                return {k: _sanitize(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_sanitize(item) for item in obj]
+            # Base cases for single values
+            if isinstance(obj, (pd.Timestamp, np.datetime64)):
+                ts = pd.to_datetime(obj)
+                if ts.tzinfo is None:
+                    return ts.tz_localize("UTC").isoformat()
+                return ts.tz_convert("UTC").isoformat()
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if pd.isna(obj):
                 return None
-            return x
-        meta.update({k: _clean(v) for k, v in extra_meta.items()})
+            return obj
+
+        # Sanitize the entire extra_meta dictionary recursively
+        sanitized_extra_meta = _sanitize(extra_meta)
+        meta.update(sanitized_extra_meta)
 
     meta_path(name).write_text(json.dumps(meta, indent=2))
-    print(f"💾 saved {name}: {len(df):,} rows → {path}")
-
+    print(f"💾 Saved {name}: {len(df):,} rows → {path}")
+    
 def load_artifact(name: str,
                   expect_fresh: bool = True
                   ) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], str]:
