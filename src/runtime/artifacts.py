@@ -1,37 +1,27 @@
-"""
-src/runtime/artifacts.py
------------------------------------------------------------------------
-Central registry (single source of truth) + Parquet/CSV I/O helpers.
-Any new artifact must be declared in ARTIFACTS below.
-"""
-
+# src/runtime/artifacts.py
 from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Any, Dict, Optional, Tuple, List
 
 import pandas as pd
 
-from src.runtime.config import get_config, _make_serializable
+from src.runtime.config import get_config
 
-#  Config & paths                                                    
 CFG = get_config()
 ARTIFACTS_DIR = Path(CFG["paths"]["ARTIFACTS_DIR"])
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
-#  Registry                                                         
 ARTIFACTS: Dict[str, Dict[str, Any]] = {
+    # Ingestion
     "nyc_raw": {
         "filename": "nyc_raw.parquet",
-        "schema_min": [
-            "unique_key", "created_date", "closed_date",
-            "descriptor", "latitude", "longitude"
-        ],
+        "schema_min": ["unique_key", "created_date", "closed_date", "descriptor", "latitude", "longitude"],
         "producer": "src.ingest.nyc",
-        "desc": "NYC 311 snow/ice requests (API filtered).",
+        "desc": "NYC 311 snow/ice 311 SRs filtered via Socrata.",
         "stale_on": ["config_hash", "code_tag"],
     },
     "tor_filtered": {
@@ -41,44 +31,41 @@ ARTIFACTS: Dict[str, Dict[str, Any]] = {
             "service_request_type", "robust_pseudo_id"
         ],
         "producer": "src.ingest.toronto",
-        "desc": "Toronto 311 snow/ice requests (CSV snapshots).",
+        "desc": "Toronto 311 snapshots filtered to snow/ice with pseudo IDs.",
         "stale_on": ["config_hash", "code_tag"],
     },
+
+    # Features (7.x)
     "wx_boro": {
         "filename": "wx_boro.parquet",
-        "schema_min": [
-            "created_hour_utc", "borough",
-            "temp", "prcp_mm", "snow_proxy_mm"
-        ],
+        "schema_min": ["created_hour_utc", "borough", "temp", "prcp_mm"],
         "producer": "src.features.weather",
-        "desc": "Hourly Meteostat features aggregated by borough.",
+        "desc": "Meteostat hourly features by borough (with rollups).",
         "stale_on": ["config_hash", "code_tag"],
     },
     "nyc_geo": {
         "filename": "nyc_geo.parquet",
-        "schema_min": [
-            "unique_key", "created_date", "created_hour_utc",
-            "tract_geoid", "borough"
-        ],
+        "schema_min": ["unique_key", "created_date", "created_hour_utc", "latitude", "longitude", "tract_geoid", "borough"],
         "producer": "src.features.spatialize",
-        "desc": "NYC SRs spatially joined to census tracts & borough.",
+        "desc": "NYC SRs spatial join to census tracts + borough.",
         "stale_on": ["config_hash", "code_tag"],
     },
     "nyc_boro_wx": {
         "filename": "nyc_boro_wx.parquet",
-        "schema_min": ["unique_key", "created_hour_utc", "borough", "prcp_mm"],
+        "schema_min": ["unique_key", "created_date", "created_hour_utc", "borough", "prcp_mm"],
         "producer": "src.features.join_weather",
-        "desc": "SRs joined to borough-hour weather.",
+        "desc": "NYC SRs joined to borough-hour weather.",
         "stale_on": ["config_hash", "code_tag"],
     },
     "nyc_geo_acs2": {
         "filename": "nyc_geo_acs2.parquet",
         "schema_min": ["unique_key", "tract_geoid", "median_hh_income"],
         "producer": "src.features.acs",
-        "desc": "SRs joined to ACS tract-level socio-economics.",
+        "desc": "NYC SRs joined to tract-level ACS metrics.",
         "stale_on": ["config_hash", "code_tag"],
     },
-    # ── Analytics & modelling ──────────────────────────────────────
+
+    # NYC analytics (6.x)
     "nyc_spatial_clusters": {
         "filename": "nyc_spatial_clusters.parquet",
         "schema_min": ["unique_key", "spatial_cluster"],
@@ -86,6 +73,8 @@ ARTIFACTS: Dict[str, Dict[str, Any]] = {
         "desc": "HDBSCAN cluster labels for NYC requests.",
         "stale_on": ["config_hash", "code_tag"],
     },
+
+    # Modeling (8.x)
     "model_base": {
         "filename": "model_base.parquet",
         "schema_min": ["unique_key", "ttc_hours", "event"],
@@ -95,112 +84,126 @@ ARTIFACTS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-#  Internal helpers                                                  
+
 def _spec(name: str) -> Dict[str, Any]:
-    if name not in ARTIFACTS:
+    try:
+        return ARTIFACTS[name]
+    except KeyError:
         raise KeyError(f"Artifact '{name}' not registered.")
-    return ARTIFACTS[name]
 
-
-def artifact_path(name: str) -> Path:
+def _path(name: str) -> Path:
     return ARTIFACTS_DIR / _spec(name)["filename"]
 
-
-def meta_path(name: str) -> Path:
-    p = artifact_path(name)
+def _meta_path(name: str) -> Path:
+    p = _path(name)
     return p.with_suffix(p.suffix + ".meta.json")
 
+def _lib_versions() -> Dict[str, str]:
+    out = {}
+    try:
+        import numpy as np, pandas as pd, sklearn as sk
+        out = {"numpy": np.__version__, "pandas": pd.__version__, "sklearn": sk.__version__}
+    except Exception:
+        pass
+    return out
 
-#  Save & load                                                       
-def save_artifact(
-    name: str,
-    df: pd.DataFrame,
-    extra_meta: Optional[Dict[str, Any]] = None,
-):
-    """
-    Write dataframe + JSON side-car atomically.
-    Overwrites if file already exists.
-    """
+def save_artifact(name: str, df: pd.DataFrame, extra_meta: Optional[Dict[str, Any]] = None) -> None:
+    """Atomic parquet write + JSON meta sidecar."""
     spec = _spec(name)
-    fpath = artifact_path(name)
-    tmp = fpath.with_suffix(".tmp")
+    p = _path(name)
+    p.parent.mkdir(parents=True, exist_ok=True)
 
+    tmp = p.with_suffix(p.suffix + ".tmp")
     df.to_parquet(tmp, index=False)
-    os.replace(tmp, fpath)
+    os.replace(tmp, p)
 
     meta = {
         "artifact": name,
         "filename": spec["filename"],
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "producer": spec.get("producer", ""),
+        "config_hash": CFG.get("config_hash"),
+        "code_tag": CFG.get("code_tag"),
+        "lib_versions": _lib_versions(),
         "rows": int(len(df)),
-        "columns": list(df.columns),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "producer": spec.get("producer"),
-        "config_hash": CFG["config_hash"],
-        "code_tag": CFG["code_tag"],
+        "columns": list(map(str, df.columns)),
         "desc": spec.get("desc", ""),
     }
     if extra_meta:
-        meta.update(_make_serializable(extra_meta))
+        def _san(v):
+            if isinstance(v, pd.Timestamp):
+                return (v.tz_convert("UTC") if v.tz is not None else v.tz_localize("UTC")).isoformat()
+            return v
+        meta.update({k: _san(v) for k, v in extra_meta.items()})
+    _meta_path(name).write_text(json.dumps(meta, indent=2))
+    print(f"💾 Saved {name}: {len(df):,} rows → {p}")
 
-    meta_path(name).write_text(json.dumps(meta, indent=2, default=str))
-    print(f"💾  Saved {name}: {len(df):,} rows → {fpath}")
-
-
-def load_artifact(
-    name: str, *, expect_fresh: bool = True
-) -> Tuple[Optional[pd.DataFrame], Dict[str, Any], str]:
-    """
-    Returns (df, meta, status)
-    status ∈ {'LOADED','MISSING','STALE (…)','SCHEMA_WARN'}
-    """
+def load_artifact(name: str, expect_fresh: bool = True) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]], str]:
+    """Return (df, meta, status) where status ∈ {'✅ LOADED','❌ MISSING','🔄 STALE (...)','⚠️ SCHEMA_WARN'}."""
     spec = _spec(name)
-    fpath, mpath = artifact_path(name), meta_path(name)
-
-    if not fpath.exists() or not mpath.exists():
-        return None, {}, "MISSING"
+    p, mp = _path(name), _meta_path(name)
+    if not p.exists() or not mp.exists():
+        return None, None, "❌ MISSING"
 
     try:
-        df = pd.read_parquet(fpath)
+        df = pd.read_parquet(p)
     except Exception:
-        return None, {}, "MISSING"
+        return None, None, "❌ MISSING"
 
-    meta = json.loads(mpath.read_text()) if mpath.exists() else {}
-    status = "LOADED"
+    try:
+        meta = json.loads(mp.read_text())
+    except Exception:
+        meta = {}
 
-    # freshness
+    status = "✅ LOADED"
     if expect_fresh:
-        for k in spec.get("stale_on", []):
-            if meta.get(k) != CFG.get(k):
-                status = f"STALE ({k})"
+        for fld in spec.get("stale_on", []):
+            if meta.get(fld) != CFG.get(fld):
+                status = f"🔄 STALE ({fld})"
                 break
 
-    # schema
-    if status == "LOADED":
-        need = set(spec["schema_min"])
-        if not need.issubset(df.columns):
-            status = "SCHEMA_WARN"
+    need = set(spec.get("schema_min", []))
+    if need and not need.issubset(df.columns):
+        status = "⚠️ SCHEMA_WARN" if status == "✅ LOADED" else status
 
     return df, meta, status
 
-
-#  Dashboard helper (used by cli/run.py)                             
-def list_artifacts_status(expect_fresh: bool = True) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
+def list_artifacts_status() -> List[Dict[str, str]]:
+    """Tabular status for CLI."""
+    rows: List[Dict[str, str]] = []
     for name, spec in ARTIFACTS.items():
-        _, meta, status = load_artifact(name, expect_fresh=expect_fresh)
-        fpath = artifact_path(name)
-        modified = (
-            datetime.fromtimestamp(fpath.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            if fpath.exists()
-            else None
-        )
-        rows.append(
-            {
-                "name": name,
+        p, mp = _path(name), _meta_path(name)
+        if p.exists() and mp.exists():
+            st = p.stat()
+            mod = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+            size_kb = f"{st.st_size/1024:.1f} KB" if st.st_size < 1024*1024 else f"{st.st_size/1024/1024:.1f} MB"
+            df, meta, status = load_artifact(name, expect_fresh=True)
+            if df is not None and isinstance(df, pd.DataFrame):
+                # crude date range if standard columns exist
+                dr_cols = [c for c in ["created_date", "closed_date", "snapshot_date"] if c in df.columns]
+                if dr_cols:
+                    d = pd.concat([pd.to_datetime(df[c], errors="coerce") for c in dr_cols], axis=0).dropna()
+                    dr = f"{d.min():%Y-%m-%d} → {d.max():%Y-%m-%d}" if not d.empty else "N/A"
+                else:
+                    dr = "N/A"
+                nrows = f"{len(df):,}"
+            else:
+                dr = "N/A"; nrows = "N/A"
+            rows.append({
+                "artifact": name,
                 "status": status,
-                "rows": meta.get("rows"),
-                "modified": modified,
-                "desc": spec.get("desc", ""),
-            }
-        )
+                "rows": nrows,
+                "date_range": dr,
+                "modified": mod,
+                "notes": size_kb,
+            })
+        else:
+            rows.append({
+                "artifact": name,
+                "status": "❌ MISSING",
+                "rows": "N/A",
+                "date_range": "N/A",
+                "modified": "N/A",
+                "notes": "",
+            })
     return rows
