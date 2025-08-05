@@ -17,11 +17,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG: Dict[str, Any] = {
     "version": 4,
     "code_tag": "311_snow_modular_v1.0",
+    # In src/runtime/config.py
+
+    # In src/runtime/config.py
+
     "paths": {
         "PROJECT_ROOT": str(PROJECT_ROOT),
         "ARTIFACTS_DIR": str(PROJECT_ROOT / "artifacts"),
         "DATA_DIR": str(PROJECT_ROOT / "data"),
-        "RAW_DATA_DIR": str(PROJECT_ROOT / "data" / "raw"),
+        # This is the NEW, specific path that toronto.py needs:
+        "RAW_TORONTO_DIR": str(PROJECT_ROOT / "data" / "raw" / "toronto"),
         "PROCESSED_DATA_DIR": str(PROJECT_ROOT / "data" / "processed"),
         "FIG_DIR": str(PROJECT_ROOT / "artifacts" / "figs"),
         "CACHE_DIR": str(PROJECT_ROOT / "artifacts" / "cache"),
