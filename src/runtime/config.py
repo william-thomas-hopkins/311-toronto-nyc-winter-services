@@ -32,9 +32,9 @@ CONFIG: Dict[str, Any] = {
         "CACHE_DIR": str(PROJECT_ROOT / "artifacts" / "cache"),
     },
     "api": {
-        "NYC_APP_TOKEN_ENV_VAR": "NYC_APP_TOKEN",
-        "NYC_BASE_URL": "https://data.cityofnewyork.us",
-        "NYC_DATASET_ID": "erm2-nwe9",
+    "NYC_APP_TOKEN_ENV_VAR": "NYC_APP_TOKEN",
+    "NYC_BASE_URL": "https://data.cityofnewyork.us",
+    "NYC_DATASET_ID": "erm2-nwe9",
     },
     "libs": {
         "numpy": "1.26.4",
